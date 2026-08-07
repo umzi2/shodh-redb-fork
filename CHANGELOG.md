@@ -1,5 +1,14 @@
 # redb - Changelog
 
+## Unreleased
+
+### Optimizations
+* Optimize inserting in ascending key order (upstream redb 4.2, #012028b). An insert past the
+  table's last key starts a new leaf page instead of splitting the full one in half. A table loaded
+  in key order occupies about half as many pages and loads about twice as fast.
+* Extend in-place deletion on uncommitted leaves down to the merge threshold, and skip redundant
+  branch updates when a child page did not change (upstream redb #775de2c, #f8ccc39).
+
 ## 0.6.0 - 2026-09-02
 
 Hardening release. 69 commits since 0.5.0.

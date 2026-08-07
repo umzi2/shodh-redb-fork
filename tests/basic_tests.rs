@@ -2515,59 +2515,42 @@ fn page_reuse_non_durable() {
     }
     txn.commit().unwrap();
 
-    // First cycle: delete + re-insert with non-durable commits
-    let mut txn = db.begin_write().unwrap();
-    let _ = txn.set_durability(Durability::None);
-    {
-        let mut table = txn.open_table(table_def).unwrap();
-        for i in 0..500u64 {
-            table.remove(&i).unwrap();
+    // One cycle: delete everything and re-insert it, each in a non-durable
+    // commit, then a durable commit to flush.
+    let cycle = || {
+        let mut txn = db.begin_write().unwrap();
+        let _ = txn.set_durability(Durability::None);
+        {
+            let mut table = txn.open_table(table_def).unwrap();
+            for i in 0..500u64 {
+                table.remove(&i).unwrap();
+            }
         }
-    }
-    txn.commit().unwrap();
+        txn.commit().unwrap();
 
-    let mut txn = db.begin_write().unwrap();
-    let _ = txn.set_durability(Durability::None);
-    {
-        let mut table = txn.open_table(table_def).unwrap();
-        for i in 0..500u64 {
-            table.insert(&i, value.as_slice()).unwrap();
+        let mut txn = db.begin_write().unwrap();
+        let _ = txn.set_durability(Durability::None);
+        {
+            let mut table = txn.open_table(table_def).unwrap();
+            for i in 0..500u64 {
+                table.insert(&i, value.as_slice()).unwrap();
+            }
         }
-    }
-    txn.commit().unwrap();
+        txn.commit().unwrap();
 
-    // Durable commit to flush
-    let txn = db.begin_write().unwrap();
-    txn.commit().unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.commit().unwrap();
 
-    let file_size_after_cycle_1 = tmpfile.as_file().metadata().unwrap().len();
+        tmpfile.as_file().metadata().unwrap().len()
+    };
 
-    // Second cycle with non-durable commits
-    let mut txn = db.begin_write().unwrap();
-    let _ = txn.set_durability(Durability::None);
-    {
-        let mut table = txn.open_table(table_def).unwrap();
-        for i in 0..500u64 {
-            table.remove(&i).unwrap();
-        }
-    }
-    txn.commit().unwrap();
-
-    let mut txn = db.begin_write().unwrap();
-    let _ = txn.set_durability(Durability::None);
-    {
-        let mut table = txn.open_table(table_def).unwrap();
-        for i in 0..500u64 {
-            table.insert(&i, value.as_slice()).unwrap();
-        }
-    }
-    txn.commit().unwrap();
-
-    // Durable commit to flush
-    let txn = db.begin_write().unwrap();
-    txn.commit().unwrap();
-
-    let file_size_after_cycle_2 = tmpfile.as_file().metadata().unwrap().len();
+    // Warm-up cycle: the file reaches its steady-state size. Ascending
+    // inserts pack leaves densely, so the first cycle can still sit just under
+    // a file-growth step that the following cycle (which holds the old and the
+    // new copy of the tree at once) crosses exactly once.
+    let _warm_up = cycle();
+    let file_size_after_cycle_1 = cycle();
+    let file_size_after_cycle_2 = cycle();
 
     assert!(
         file_size_after_cycle_2 <= file_size_after_cycle_1 * 110 / 100,
@@ -2617,3 +2600,81 @@ fn database_stats_free_pages() {
     );
     txn.commit().unwrap();
 }
+// An insert past the table's last key starts a new leaf, instead of splitting the full
+// one evenly. An ascending load never returns to a leaf it has moved past, so an even
+// split would strand half of every leaf behind it.
+#[test]
+fn ascending_inserts_pack_leaves() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, [u8; 150]> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in 0u64..20_000 {
+            table.insert(i, [0u8; 150]).unwrap();
+        }
+        // 25 of these pairs fit in a page, so 800 packed leaves hold them all, where
+        // splitting evenly leaves each half full and needs over 1,500
+        let leaves = table.stats().unwrap().leaf_pages();
+        assert!(leaves < 900, "{leaves} leaves");
+    }
+    write_txn.commit().unwrap();
+}
+
+// The leaf appended to is committed here, and so cannot be modified in place
+#[test]
+fn ascending_inserts_pack_leaves_across_transactions() {
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, [u8; 150]> = TableDefinition::new("x");
+
+    for chunk in 0u64..20 {
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(definition).unwrap();
+            for i in chunk * 1_000..(chunk + 1) * 1_000 {
+                table.insert(i, [0u8; 150]).unwrap();
+            }
+        }
+        write_txn.commit().unwrap();
+    }
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(definition).unwrap();
+    assert_eq!(table.len().unwrap(), 20_000);
+    let leaves = table.stats().unwrap().leaf_pages();
+    assert!(leaves < 900, "{leaves} leaves");
+}
+
+// Packing only changes the layout: a key that later falls inside a packed leaf must
+// still be accepted, splitting it as usual
+#[test]
+fn packed_leaves_accept_interior_inserts() {
+    let tmpfile = create_tempfile();
+    let mut db = Database::create(tmpfile.path()).unwrap();
+
+    let definition: TableDefinition<u64, [u8; 150]> = TableDefinition::new("x");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(definition).unwrap();
+        for i in (0u64..20_000).step_by(2) {
+            table.insert(i, [0u8; 150]).unwrap();
+        }
+        for i in (1u64..20_000).step_by(2) {
+            table.insert(i, [0u8; 150]).unwrap();
+        }
+        assert_eq!(table.len().unwrap(), 20_000);
+        for i in 0u64..20_000 {
+            assert!(table.get(i).unwrap().is_some());
+        }
+    }
+    write_txn.commit().unwrap();
+
+    db.check_integrity().unwrap();
+}
+

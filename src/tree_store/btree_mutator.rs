@@ -308,6 +308,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                 K::as_bytes(key).as_ref(),
                 value_bytes_ref,
                 0,
+                true,
             )?;
 
             let new_length = if result.old_value.is_some() {
@@ -365,6 +366,9 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
     /// A stack overflow is not a panic. It cannot be caught, it takes the
     /// process with it, and it is reachable here from the allocator state tree
     /// during commit -- which `Database::drop` performs.
+    ///
+    /// `rightmost` is true when every branch above descended into its last child, so the
+    /// greatest key in this subtree is also the greatest in the tree.
     fn insert_helper(
         &mut self,
         page: PageImpl,
@@ -372,6 +376,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
         key: &[u8],
         value: &[u8],
         depth: u32,
+        rightmost: bool,
     ) -> Result<Box<InsertionResult<'a, V>>> {
         if depth > MAX_TREE_DEPTH {
             return Err(StorageError::Corrupted(format!(
@@ -483,6 +488,53 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                         additional_sibling: None,
                         inserted_value: guard,
                         old_value: existing_value,
+                    }));
+                }
+
+                // Fast-path for a key greater than every key in the tree, when the rightmost
+                // leaf is too full to take it: leave that leaf packed and start a new one
+                // holding only the new pair. Splitting evenly instead would strand half of a
+                // leaf that an ascending load, having moved past it, never returns to.
+                if rightmost
+                    && position == accessor.num_pairs()
+                    && accessor.num_pairs() > 0
+                    && RawLeafBuilder::required_bytes(
+                        accessor.num_pairs() + 1,
+                        accessor.length_of_pairs(0, accessor.num_pairs()) + key.len() + value.len(),
+                        K::fixed_width(),
+                        self.value_width(),
+                    ) > self.mem.get_page_size()
+                {
+                    let split_key = accessor
+                        .last_entry()
+                        .ok_or_else(|| {
+                            StorageError::Corrupted("rightmost leaf has no last entry".into())
+                        })?
+                        .key()
+                        .to_vec();
+                    let mut builder = LeafBuilder::new(
+                        &self.mem,
+                        &self.allocated,
+                        1,
+                        K::fixed_width(),
+                        self.value_width(),
+                    );
+                    builder.push(key, value);
+                    let new_page = builder.build()?;
+                    let new_page_number = new_page.get_page_number();
+                    let new_page_accessor = LeafAccessor::new(
+                        new_page.memory(),
+                        K::fixed_width(),
+                        self.value_width(),
+                    )?;
+                    let offset = new_page_accessor.offset_of_first_value();
+                    let guard = AccessGuardMutInPlace::new(new_page, offset, value.len());
+                    return Ok(Box::new(InsertionResult {
+                        new_root: page.get_page_number(),
+                        root_checksum: page_checksum,
+                        additional_sibling: Some((split_key, new_page_number, DEFERRED)),
+                        inserted_value: guard,
+                        old_value: None,
                     }));
                 }
 
@@ -631,6 +683,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                     key,
                     value,
                     depth + 1,
+                    rightmost && child_index == accessor.count_children() - 1,
                 )?;
 
                 // Skip-path: if child page number and checksum haven't changed,
@@ -641,13 +694,13 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                     && sub_result.new_root == child_page
                     && sub_result.root_checksum == child_checksum
                 {
-                    return Ok(InsertionResult {
+                    return Ok(Box::new(InsertionResult {
                         new_root: page.get_page_number(),
                         root_checksum: page_checksum,
                         additional_sibling: None,
                         inserted_value: sub_result.inserted_value,
                         old_value: sub_result.old_value,
-                    });
+                    }));
                 }
 
                 if sub_result.additional_sibling.is_none()
@@ -1026,7 +1079,7 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
             // Skip-path: if child page number and checksum haven't changed,
             // no branch update is needed.
             if new_child == child_page_number && new_child_checksum == child_checksum {
-                return Ok((Subtree(original_page_number, checksum), found));
+                return Ok(Box::new((Subtree(original_page_number, checksum), found)));
             }
 
             let result_page =
