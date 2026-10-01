@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Bug fixes
+* Fix unbounded memory growth in the page cache under write workloads, when the cache never
+  reached its configured size limit (upstream redb f95d460). Every write to a cached page removes
+  and re-inserts it; the LRU queue kept one stale entry per write forever.
+
 ### Optimizations
 * Optimize inserting in ascending key order (upstream redb 4.2, #012028b). An insert past the
   table's last key starts a new leaf page instead of splitting the full one in half. A table loaded
