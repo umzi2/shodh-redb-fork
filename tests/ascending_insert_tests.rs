@@ -346,3 +346,30 @@ fn ascending_with_lz4_compression() {
     drop(rtxn);
     db.check_integrity().unwrap();
 }
+
+/// One huge value in a leaf, followed by far more tiny ascending inserts than
+/// a u16 entry count can hold. Neither the in-place append path nor the new
+/// "start a leaf past the last key" path may overflow a leaf's counters.
+#[test]
+fn huge_value_then_many_tiny_ascending_inserts() {
+    let file = tmp();
+    let mut db = Database::create(file.path()).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let mut t = txn.open_table(U64_BYTES).unwrap();
+        let big = vec![7u8; 8 * 1024 * 1024];
+        t.insert(0u64, big.as_slice()).unwrap();
+        for i in 1..90_000u64 {
+            t.insert(i, &[1u8][..]).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    let rtxn = db.begin_read().unwrap();
+    let t = rtxn.open_table(U64_BYTES).unwrap();
+    assert_eq!(t.len().unwrap(), 90_000);
+    assert_eq!(t.get(0).unwrap().unwrap().value().len(), 8 * 1024 * 1024);
+    assert_eq!(t.get(89_999).unwrap().unwrap().value(), &[1u8][..]);
+    drop(t);
+    drop(rtxn);
+    db.check_integrity().unwrap();
+}

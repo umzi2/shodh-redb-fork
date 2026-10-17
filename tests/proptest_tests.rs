@@ -556,3 +556,135 @@ fn make_vec(dim: usize, seed: u64) -> Vec<f32> {
     }
     v
 }
+
+// ---------------------------------------------------------------------------
+// Model check: ascending, descending and random-order inserts, overwrites and
+// removes across several commits (durable and not) must always match a
+// BTreeMap, keep the table iterable in key order and pass check_integrity().
+// Exercises the "insert past the last key" leaf path against every other path.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+enum Op {
+    /// `count` inserts at consecutive keys past the current maximum
+    Append {
+        count: u16,
+        value_len: u16,
+    },
+    /// `count` inserts at consecutive keys below the current minimum
+    Prepend {
+        count: u16,
+        value_len: u16,
+    },
+    /// Insert/overwrite at an arbitrary key
+    Put {
+        key: u16,
+        value_len: u16,
+    },
+    Remove {
+        key: u16,
+    },
+    /// Close the current write transaction (durable or not) and open another
+    Commit {
+        durable: bool,
+    },
+}
+
+fn op_strategy() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        4 => (1u16..400, 0u16..200).prop_map(|(count, value_len)| Op::Append { count, value_len }),
+        1 => (1u16..100, 0u16..200).prop_map(|(count, value_len)| Op::Prepend { count, value_len }),
+        3 => (any::<u16>(), 0u16..3_000).prop_map(|(key, value_len)| Op::Put { key, value_len }),
+        2 => any::<u16>().prop_map(|key| Op::Remove { key }),
+        2 => any::<bool>().prop_map(|durable| Op::Commit { durable }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(300))]
+
+    #[test]
+    fn ascending_and_mixed_ops_match_model(ops in prop::collection::vec(op_strategy(), 1..40)) {
+        use std::collections::BTreeMap;
+        let tmpfile = create_tempfile();
+        let mut db = Database::create(tmpfile.path()).unwrap();
+        let mut model: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        // Keys live above 1<<32 so Prepend has room below them.
+        let mut next_hi: u64 = 1 << 32;
+        let mut next_lo: u64 = (1 << 32) - 1;
+        let mut serial: u64 = 0;
+        // Create the table up front so an op list that never touches it still reads back.
+        let setup = db.begin_write().unwrap();
+        drop(setup.open_table(TABLE).unwrap());
+        setup.commit().unwrap();
+        let mut txn = Some(db.begin_write().unwrap());
+
+        let val = |serial: u64, len: u16| -> Vec<u8> {
+            (0..len).map(|j| (serial as u8).wrapping_add(j as u8)).collect()
+        };
+
+        for op in ops {
+            let t = txn.as_mut().unwrap();
+            match op {
+                Op::Append { count, value_len } => {
+                    let mut table = t.open_table(TABLE).unwrap();
+                    for _ in 0..count {
+                        serial += 1;
+                        let v = val(serial, value_len);
+                        table.insert(&next_hi, v.as_slice()).unwrap();
+                        model.insert(next_hi, v);
+                        next_hi += 1;
+                    }
+                }
+                Op::Prepend { count, value_len } => {
+                    let mut table = t.open_table(TABLE).unwrap();
+                    for _ in 0..count {
+                        serial += 1;
+                        let v = val(serial, value_len);
+                        table.insert(&next_lo, v.as_slice()).unwrap();
+                        model.insert(next_lo, v);
+                        next_lo -= 1;
+                    }
+                }
+                Op::Put { key, value_len } => {
+                    let k = (1u64 << 32) + u64::from(key) % 2_000;
+                    serial += 1;
+                    let v = val(serial, value_len);
+                    let mut table = t.open_table(TABLE).unwrap();
+                    let old = table.insert(&k, v.as_slice()).unwrap().map(|g| g.value().to_vec());
+                    prop_assert_eq!(old, model.insert(k, v));
+                }
+                Op::Remove { key } => {
+                    let k = (1u64 << 32) + u64::from(key) % 2_000;
+                    let mut table = t.open_table(TABLE).unwrap();
+                    let old = table.remove(&k).unwrap().map(|g| g.value().to_vec());
+                    prop_assert_eq!(old, model.remove(&k));
+                }
+                Op::Commit { durable } => {
+                    let mut finished = txn.take().unwrap();
+                    if !durable {
+                        finished.set_durability(Durability::None).unwrap();
+                    }
+                    finished.commit().unwrap();
+                    txn = Some(db.begin_write().unwrap());
+                }
+            }
+        }
+        txn.take().unwrap().commit().unwrap();
+
+        let rtxn = db.begin_read().unwrap();
+        let table = rtxn.open_table(TABLE).unwrap();
+        prop_assert_eq!(table.len().unwrap(), model.len() as u64);
+        let mut got = table.iter().unwrap();
+        for (k, v) in &model {
+            let (gk, gv) = got.next().expect("table has fewer rows than the model").unwrap();
+            prop_assert_eq!(gk.value(), *k);
+            prop_assert_eq!(gv.value(), v.as_slice());
+        }
+        prop_assert!(got.next().is_none(), "table has more rows than the model");
+        drop(got);
+        drop(table);
+        drop(rtxn);
+        db.check_integrity().unwrap();
+    }
+}
