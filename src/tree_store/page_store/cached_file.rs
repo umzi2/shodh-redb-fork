@@ -300,9 +300,22 @@ const MAX_COALESCED_WRITE_BYTES: usize = 1 << 20;
 pub(super) struct PagedCachedFile {
     file: CheckedBackend,
     page_size: u64,
-    max_read_cache_bytes: usize,
+    // Dynamic cache partitioning (upstream redb 3c07822). The configured read
+    // and write limits add up to one shared budget `max_cache_bytes`; neither
+    // side owns a fixed slice of it:
+    //
+    // 1. The write buffer never exceeds half of the budget; dirty pages beyond
+    //    that are written out immediately.
+    // 2. Read-cache pages are evicted whenever read + write exceeds the budget,
+    //    so a write-heavy transaction can take over unused read cache, while a
+    //    read-only workload still gets the whole budget.
+    //
+    // A static 90/10 split made any transaction whose dirty set exceeded 10%
+    // of the cache evict dirty pages to disk and read them back on the next
+    // touch (pwrite/pread thrash). Total memory is unchanged.
     read_cache_bytes: AtomicUsize,
     max_write_buffer_bytes: usize,
+    max_cache_bytes: usize,
     write_buffer_bytes: AtomicUsize,
     memory_budget: Option<usize>,
     #[cfg(feature = "cache_metrics")]
@@ -336,9 +349,9 @@ impl PagedCachedFile {
         Ok(Self {
             file: CheckedBackend::new(file),
             page_size,
-            max_read_cache_bytes,
             read_cache_bytes: AtomicUsize::new(0),
             max_write_buffer_bytes,
+            max_cache_bytes: max_read_cache_bytes.saturating_add(max_write_buffer_bytes),
             write_buffer_bytes: AtomicUsize::new(0),
             memory_budget,
             #[cfg(feature = "cache_metrics")]
@@ -516,7 +529,7 @@ impl PagedCachedFile {
                 .read_cache_bytes
                 .fetch_add(buffer.len(), Ordering::AcqRel);
 
-            if cache_size + buffer.len() <= self.max_read_cache_bytes {
+            if cache_size + buffer.len() <= self.max_cache_bytes {
                 let cache_slot: usize = Self::cache_slot(*offset);
                 let mut lock = self.read_cache[cache_slot].write();
                 if let Some(replaced) = lock.insert(*offset, buffer) {
@@ -648,7 +661,8 @@ impl PagedCachedFile {
             cache_size
         };
         let mut removed = 0;
-        if cache_size + buffer.len() > self.max_read_cache_bytes {
+        let write_bytes = self.write_buffer_bytes.load(Ordering::Acquire);
+        if cache_size + buffer.len() + write_bytes > self.max_cache_bytes {
             while removed < buffer.len() {
                 if let Some((_, v)) = write_lock.pop_lowest_priority() {
                     #[cfg(feature = "cache_metrics")]
@@ -889,7 +903,15 @@ impl PagedCachedFile {
         } else {
             let previous = self.write_buffer_bytes.fetch_add(len, Ordering::AcqRel);
             // Compute how many bytes to evict: at least the overage beyond the limit.
-            let overage = (previous + len).saturating_sub(self.max_write_buffer_bytes);
+            // The write buffer may grow to half of the shared budget; a cache
+            // configured with no write buffer at all (header-only caches) keeps
+            // evicting every page at once.
+            let write_limit = if self.max_write_buffer_bytes == 0 {
+                0
+            } else {
+                self.max_cache_bytes / 2
+            };
+            let overage = (previous + len).saturating_sub(write_limit);
             if overage > 0 {
                 let mut removed_bytes = 0;
                 while removed_bytes < overage {
@@ -910,6 +932,14 @@ impl PagedCachedFile {
                     } else {
                         break;
                     }
+                }
+            }
+            // The write buffer grew into space the read cache was using: give
+            // that space back so read + write stays within the shared budget.
+            if self.max_write_buffer_bytes != 0 {
+                let total = self.total_cache_bytes();
+                if total > self.max_cache_bytes {
+                    self.evict_read_cache_global(total - self.max_cache_bytes);
                 }
             }
             // Under a memory budget, also evict from the read cache to keep
@@ -1076,6 +1106,105 @@ mod test {
         let mut out = [1u8; 128];
         backend.inner.read(8 * 128, &mut out).unwrap();
         assert!(out.iter().all(|b| *b == 0));
+    }
+
+    fn recording_cache(
+        pages: u64,
+        max_read: usize,
+        max_write: usize,
+    ) -> (std::sync::Arc<RecordingBackend>, PagedCachedFile) {
+        let backend = std::sync::Arc::new(RecordingBackend {
+            inner: InMemoryBackend::new(),
+            writes: std::sync::Mutex::new(alloc::vec::Vec::new()),
+        });
+        backend.set_len(pages * 128).unwrap();
+        let cached_file =
+            PagedCachedFile::new(Box::new(backend.clone()), 128, max_read, max_write, None)
+                .unwrap();
+        (backend, cached_file)
+    }
+
+    /// With an idle read cache the write buffer may use up to half of the
+    /// shared budget (it used to be capped at its static 10% slice, which made
+    /// every dirty page beyond that round-trip through the file).
+    #[test]
+    fn write_buffer_grows_past_its_static_slice_up_to_half_the_budget() {
+        // Budget: 1000 pages = 900 read + 100 write; half = 500 pages.
+        let (backend, cached_file) = recording_cache(2000, 900 * 128, 100 * 128);
+
+        for page in 0..500u64 {
+            let mut w = cached_file.write(page * 128, 128, true).unwrap();
+            w.mem_mut().unwrap().fill(1);
+        }
+        assert_eq!(
+            backend.writes.lock().unwrap().len(),
+            0,
+            "no dirty page may be evicted while the buffer is within half the budget"
+        );
+        assert_eq!(cached_file.write_buffer_bytes.load(Ordering::Acquire), 500 * 128);
+
+        // Past half the budget dirty pages are written out, oldest first.
+        for page in 500..700u64 {
+            let mut w = cached_file.write(page * 128, 128, true).unwrap();
+            w.mem_mut().unwrap().fill(2);
+        }
+        let write_bytes = cached_file.write_buffer_bytes.load(Ordering::Acquire);
+        assert!(write_bytes <= 500 * 128, "write buffer at {write_bytes} bytes");
+        assert!(!backend.writes.lock().unwrap().is_empty());
+    }
+
+    /// A write-heavy phase takes over read-cache space, but read + write never
+    /// exceeds the budget and the evicted pages are the read ones.
+    #[test]
+    fn write_buffer_reclaims_read_cache_to_stay_within_budget() {
+        let (_backend, cached_file) = recording_cache(2000, 900 * 128, 100 * 128);
+        let budget = 1000 * 128;
+
+        for page in 0..900u64 {
+            cached_file.read(page * 128, 128, PageHint::None).unwrap();
+        }
+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 900 * 128);
+
+        for page in 1000..1400u64 {
+            let mut w = cached_file.write(page * 128, 128, true).unwrap();
+            w.mem_mut().unwrap().fill(3);
+            let total = cached_file.read_cache_bytes.load(Ordering::Acquire)
+                + cached_file.write_buffer_bytes.load(Ordering::Acquire);
+            assert!(total <= budget, "total {total} exceeds budget {budget}");
+        }
+        assert_eq!(cached_file.write_buffer_bytes.load(Ordering::Acquire), 400 * 128);
+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 600 * 128);
+    }
+
+    /// Reads fill the whole budget when nothing is being written.
+    #[test]
+    fn read_cache_may_use_the_whole_budget_when_idle() {
+        let (_backend, cached_file) = recording_cache(2000, 900 * 128, 100 * 128);
+        for page in 0..1500u64 {
+            cached_file.read(page * 128, 128, PageHint::None).unwrap();
+        }
+        let read_bytes = cached_file.read_cache_bytes.load(Ordering::Acquire);
+        assert!(read_bytes <= 1000 * 128, "read cache {read_bytes}");
+        assert!(read_bytes >= 950 * 128, "read cache only {read_bytes}");
+    }
+
+    /// A flush promotes the written pages into the read cache, still within
+    /// the shared budget.
+    #[test]
+    fn flush_promotion_respects_the_shared_budget() {
+        let (_backend, cached_file) = recording_cache(2000, 900 * 128, 100 * 128);
+        for page in 0..400u64 {
+            cached_file.read(page * 128, 128, PageHint::None).unwrap();
+        }
+        for page in 1000..1450u64 {
+            let mut w = cached_file.write(page * 128, 128, true).unwrap();
+            w.mem_mut().unwrap().fill(4);
+        }
+        cached_file.flush().unwrap();
+        let total = cached_file.read_cache_bytes.load(Ordering::Acquire)
+            + cached_file.write_buffer_bytes.load(Ordering::Acquire);
+        assert!(total <= 1000 * 128, "total {total}");
+        assert_eq!(cached_file.write_buffer_bytes.load(Ordering::Acquire), 0);
     }
 
     #[test]
