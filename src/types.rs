@@ -605,8 +605,17 @@ impl Value for String {
     where
         Self: 'a,
     {
-        // Lossy conversion to avoid crashing on corrupted UTF-8 data
-        String::from_utf8_lossy(data).into_owned()
+        // Never crash on corrupted UTF-8 data: invalid bytes become U+FFFD.
+        //
+        // `core::str::from_utf8` validates a word at a time and succeeds for every
+        // value written through this crate. `String::from_utf8_lossy` walks the bytes
+        // through `Utf8Chunks` even when the input is valid, which made reading a
+        // 200 byte `String` ~3x slower (range scans spent more than half their time
+        // there). The lossy path is only taken for data that is actually corrupt.
+        match core::str::from_utf8(data) {
+            Ok(valid) => String::from(valid),
+            Err(_) => String::from_utf8_lossy(data).into_owned(),
+        }
     }
 
     fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> &'a str
@@ -770,3 +779,52 @@ le_signed_impl!(i64);
 le_signed_impl!(i128);
 le_value!(f32);
 le_value!(f64);
+
+#[cfg(test)]
+mod tests {
+    use super::Value;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn string_from_bytes_valid_input_is_exact() {
+        for s in [
+            "",
+            "a",
+            "plain ascii value",
+            "caf\u{e9}",
+            "\u{4e2d}\u{6587}",
+            "emoji \u{1f600} inside",
+        ] {
+            assert_eq!(<String as Value>::from_bytes(s.as_bytes()), s);
+        }
+        // Long ASCII input: the word-at-a-time validation path.
+        let long = "x".repeat(10_000);
+        assert_eq!(<String as Value>::from_bytes(long.as_bytes()), long);
+    }
+
+    /// Corrupt bytes never panic and are replaced exactly as
+    /// `String::from_utf8_lossy` does.
+    #[test]
+    fn string_from_bytes_corrupt_input_is_lossy_not_a_panic() {
+        let cases: [&[u8]; 5] = [
+            &[0xFF],
+            b"ok\xFFok",
+            b"trunc\xE4\xB8",
+            &[0xC0, 0x80],
+            &[0xF0, 0x9F, 0x98],
+        ];
+        for bytes in cases {
+            let got = <String as Value>::from_bytes(bytes);
+            assert_eq!(got, String::from_utf8_lossy(bytes));
+            assert!(got.contains('\u{FFFD}'));
+        }
+        let mut mixed: Vec<u8> = "valid prefix ".as_bytes().to_vec();
+        mixed.push(0x80);
+        mixed.extend_from_slice("valid suffix".as_bytes());
+        assert_eq!(
+            <String as Value>::from_bytes(&mixed),
+            "valid prefix \u{FFFD}valid suffix"
+        );
+    }
+}
