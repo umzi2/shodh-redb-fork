@@ -1043,11 +1043,10 @@ fn corrupt_commit_slot_fallback_survives_repair_path() {
 /// failing and the clean-commit cases are covered.
 #[test]
 fn crash_at_every_write_point_recovers() {
-    const SWEEP: u64 = 100;
-    // Guards against the sweep silently going vacuous if the I/O sequence ever
-    // gets shorter than the range: without this, every case would commit
-    // cleanly and the test would still pass while injecting nothing.
-    const MIN_INJECTED: u64 = 40;
+    // A commit needs at least: data write(s), fsync, header write, fsync.
+    const MIN_OPS: u64 = 4;
+    // Clean-commit points checked beyond the end of the I/O sequence.
+    const PAST_END: u64 = 5;
 
     let baseline = create_tempfile();
     {
@@ -1056,8 +1055,50 @@ fn crash_at_every_write_point_recovers() {
     }
     let pristine = std::fs::read(baseline.path()).unwrap();
 
+    let workload = |db: &Database| -> Result<(), shodh_redb::Error> {
+        let txn = db.begin_write()?;
+        {
+            let mut t = txn.open_table(TABLE)?;
+            for i in 0..2000u64 {
+                t.insert(&i, &[0xDD; 64][..])?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    };
+
+    // Calibration: count the backend operations of open + workload (the ones a
+    // failure is reported for) and of the close that follows (a failure there
+    // leaves the committed state behind, and must still recover).
+    const CALIBRATION_BUDGET: u64 = 1 << 40;
+    let (commit_ops, total_ops) = {
+        let work = create_tempfile();
+        std::fs::write(work.path(), &pristine).unwrap();
+        let file_backend = FileBackend::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(work.path())
+                .unwrap(),
+        )
+        .unwrap();
+        let crash_backend = CountdownBackend::new(file_backend, CALIBRATION_BUDGET);
+        let remaining = crash_backend.countdown.clone();
+        let db = Builder::new().create_with_backend(crash_backend).unwrap();
+        workload(&db).unwrap();
+        let commit_ops = CALIBRATION_BUDGET - remaining.load(Ordering::SeqCst);
+        drop(db);
+        (commit_ops, CALIBRATION_BUDGET - remaining.load(Ordering::SeqCst))
+    };
+    assert!(
+        commit_ops >= MIN_OPS,
+        "calibration saw only {commit_ops} backend operations in the commit"
+    );
+
     let mut injected = 0u64;
-    for countdown in 1..=SWEEP {
+    // `countdown` operations succeed, the next one fails: 0..commit_ops covers
+    // every operation of the commit being the failing one.
+    for countdown in 0..=total_ops + PAST_END {
         let work = create_tempfile();
         std::fs::write(work.path(), &pristine).unwrap();
 
@@ -1074,18 +1115,7 @@ fn crash_at_every_write_point_recovers() {
 
             match Builder::new().create_with_backend(crash_backend) {
                 Ok(db) => {
-                    let result = (|| -> Result<(), shodh_redb::Error> {
-                        let txn = db.begin_write()?;
-                        {
-                            let mut t = txn.open_table(TABLE)?;
-                            for i in 0..2000u64 {
-                                t.insert(&i, &[0xDD; 64][..])?;
-                            }
-                        }
-                        txn.commit()?;
-                        Ok(())
-                    })();
-                    if result.is_err() {
+                    if workload(&db).is_err() {
                         injected += 1;
                     }
                     drop(db);
@@ -1102,10 +1132,172 @@ fn crash_at_every_write_point_recovers() {
         assert!(report.valid, "countdown {countdown}: {report:?}");
     }
 
+    // Every operation up to the end of the commit must have surfaced as an
+    // error when it was the one that failed.
     assert!(
-        injected >= MIN_INJECTED,
-        "only {injected} of {SWEEP} crash points injected a failure; the sweep          no longer covers the commit's I/O sequence"
+        injected >= commit_ops,
+        "only {injected} of {commit_ops} commit crash points injected a failure; the sweep no longer covers the commit's I/O sequence"
     );
+}
+
+/// Like `CountdownBackend`, but the write that exhausts the countdown is *torn*:
+/// only the first half of its bytes reach the file before the error. The page
+/// cache merges adjacent dirty pages into a single large write, so a crash in
+/// the middle of one write now spans many pages at once.
+struct TornWriteBackend {
+    inner: FileBackend,
+    countdown: Arc<AtomicU64>,
+}
+
+impl fmt::Debug for TornWriteBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TornWriteBackend").finish()
+    }
+}
+
+impl TornWriteBackend {
+    /// `Ok(true)` while operations may proceed, `Ok(false)` on the operation
+    /// that fails now (the caller decides what to leave behind), `Err` after.
+    fn step(&self) -> Result<bool, BackendError> {
+        match self
+            .countdown
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| x.checked_sub(1))
+        {
+            Ok(_) => Ok(true),
+            Err(_) => Err(std::io::Error::from(ErrorKind::Other).into()),
+        }
+    }
+}
+
+impl StorageBackend for TornWriteBackend {
+    fn len(&self) -> Result<u64, BackendError> {
+        if self.countdown.load(Ordering::SeqCst) == 0 {
+            return Err(std::io::Error::from(ErrorKind::Other).into());
+        }
+        self.inner.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), BackendError> {
+        if self.countdown.load(Ordering::SeqCst) == 0 {
+            return Err(std::io::Error::from(ErrorKind::Other).into());
+        }
+        self.inner.read(offset, out)
+    }
+
+    fn set_len(&self, len: u64) -> Result<(), BackendError> {
+        self.step()?;
+        self.inner.set_len(len)
+    }
+
+    fn sync_data(&self) -> Result<(), BackendError> {
+        self.step()?;
+        self.inner.sync_data()
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), BackendError> {
+        if self.countdown.load(Ordering::SeqCst) == 1 {
+            // This is the write that fails: tear it.
+            let torn = data.len() / 2;
+            if torn > 0 {
+                self.inner.write(offset, &data[..torn])?;
+            }
+        }
+        self.step()?;
+        self.inner.write(offset, data)
+    }
+}
+
+/// A torn write at any point of a commit must leave the database either at the
+/// previous commit or at the new one, never in between: the cache's merged
+/// writes make a single backend write span many pages, so tearing one is the
+/// realistic failure shape.
+#[test]
+fn torn_write_at_every_point_is_atomic() {
+    const N: u64 = 2000;
+    let baseline = create_tempfile();
+    {
+        let db = populate_baseline(baseline.path(), N);
+        drop(db);
+    }
+    let pristine = std::fs::read(baseline.path()).unwrap();
+
+    let workload = |db: &Database| -> Result<(), shodh_redb::Error> {
+        let txn = db.begin_write()?;
+        {
+            let mut t = txn.open_table(TABLE)?;
+            for i in 0..N {
+                t.insert(&i, &[0xDD; 64][..])?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    };
+
+    let open_backend = |path: &std::path::Path, budget: u64| {
+        let file_backend = FileBackend::new(
+            OpenOptions::new().read(true).write(true).open(path).unwrap(),
+        )
+        .unwrap();
+        let countdown = Arc::new(AtomicU64::new(budget));
+        (
+            TornWriteBackend {
+                inner: file_backend,
+                countdown: countdown.clone(),
+            },
+            countdown,
+        )
+    };
+
+    const BUDGET: u64 = 1 << 40;
+    let commit_ops = {
+        let work = create_tempfile();
+        std::fs::write(work.path(), &pristine).unwrap();
+        let (backend, countdown) = open_backend(work.path(), BUDGET);
+        let db = Builder::new().create_with_backend(backend).unwrap();
+        workload(&db).unwrap();
+        BUDGET - countdown.load(Ordering::SeqCst)
+    };
+    assert!(commit_ops >= 4, "only {commit_ops} operations in the commit");
+
+    let mut saw_old = false;
+    let mut saw_new = false;
+    for budget in 1..=commit_ops + 2 {
+        let work = create_tempfile();
+        std::fs::write(work.path(), &pristine).unwrap();
+        {
+            let (backend, _countdown) = open_backend(work.path(), budget);
+            if let Ok(db) = Builder::new().create_with_backend(backend) {
+                let _ = workload(&db);
+                drop(db);
+            }
+        }
+
+        let db = Database::open(work.path())
+            .unwrap_or_else(|e| panic!("budget {budget}: reopen failed: {e:?}"));
+        let report = db.verify_integrity(VerifyLevel::Pages).unwrap();
+        assert!(report.valid, "budget {budget}: {report:?}");
+
+        let txn = db.begin_read().unwrap();
+        let t = txn.open_table(TABLE).unwrap();
+        assert_eq!(t.len().unwrap(), N, "budget {budget}");
+        let first = t.get(&0).unwrap().unwrap().value().to_vec();
+        let new_state = first[0] == 0xDD;
+        for i in 0..N {
+            let want = if new_state { vec![0xDD; 64] } else { vec![(i & 0xFF) as u8; 64] };
+            assert_eq!(
+                t.get(&i).unwrap().unwrap().value(),
+                want.as_slice(),
+                "budget {budget}: key {i} is not atomic with key 0 (new_state={new_state})"
+            );
+        }
+        if new_state {
+            saw_new = true;
+        } else {
+            saw_old = true;
+        }
+    }
+    assert!(saw_old, "no crash point left the previous commit in place");
+    assert!(saw_new, "no point ran past the commit");
 }
 
 /// A page index must be addressable by `PageNumber`, so `region_max_data_pages`
