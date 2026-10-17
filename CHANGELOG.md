@@ -2,17 +2,48 @@
 
 ## Unreleased
 
+Performance and memory release, largely ported from upstream redb 4.x (the commit each
+change comes from is named; the fork shares history with upstream up to 3.1.2).
+
 ### Bug fixes
-* Fix unbounded memory growth in the page cache under write workloads, when the cache never
-  reached its configured size limit (upstream redb f95d460). Every write to a cached page removes
-  and re-inserts it; the LRU queue kept one stale entry per write forever.
+* **Fix unbounded growth of the page cache's LRU queue** (upstream f95d460). Every write to a
+  cached page removes and re-inserts it, and the queue kept a stale entry per write forever
+  whenever the cache was below its size limit. The fix tags queue entries with a sequence number so
+  stale ones are recognised and dropped in O(1).
+* **Fix non-durable commit cost growing with every earlier non-durable commit.** The tracker's
+  "unprocessed non-durable commit" set was never cleared by a durable commit; a commit that freed no
+  pages stayed in it forever, and the oldest such id became the lower bound of a range scan over the
+  freed table. Per-commit cost grew from 35 us to 115 us over 500k commits, and the set grew without
+  bound. A durable commit now clears it.
 
 ### Optimizations
-* Optimize inserting in ascending key order (upstream redb 4.2, #012028b). An insert past the
-  table's last key starts a new leaf page instead of splitting the full one in half. A table loaded
-  in key order occupies about half as many pages and loads about twice as fast.
+* **Ascending inserts** (upstream 012028b). An insert past the table's last key starts a new leaf
+  instead of splitting the full one in half. A table loaded in key order is half the size and loads
+  ~1.7x faster (500k sequential u64 keys, 200 B values: 759k -> 1.3M inserts/s, 257 MiB -> 128 MiB).
+* **Dynamic read/write cache partitioning** (upstream 3c07822). The write buffer may use up to half
+  of the cache budget and the read cache gives space back when a write transaction needs it; the
+  total is unchanged. Before, a transaction whose dirty set exceeded 10 % of the cache evicted dirty
+  pages to disk and read them back (2.2x slower random inserts in one transaction).
+* **Write coalescing**: `flush_write_buffer` sorts the dirty pages by offset and merges adjacent
+  ones (up to 1 MiB) into a single write. Commits issue far fewer syscalls.
+* The read cache is no longer dropped when the file grows (upstream 70a23aa); only shrinking drops
+  it.
+* `Btree::get` borrows pages while descending instead of cloning an `Arc` per level (upstream
+  7b32c97).
 * Extend in-place deletion on uncommitted leaves down to the merge threshold, and skip redundant
-  branch updates when a child page did not change (upstream redb #775de2c, #f8ccc39).
+  branch updates when a child page did not change (upstream 775de2c, f8ccc39).
+* `TransactionTracker` keeps the non-durable ancestor holds incrementally instead of rebuilding them
+  from every pending commit on each call.
+
+### Tests
+* `tests/ascending_insert_tests.rs`, `tests/non_durable_cycles.rs`, a model-based proptest of
+  ascending/mixed operations, unit tests for the LRU queue, write coalescing, cache partitioning,
+  resize, and the transaction tracker.
+* `crash_at_every_write_point_recovers` calibrates the commit's I/O sequence instead of assuming it
+  is ~80 operations long (merged writes shorten it), and `torn_write_at_every_point_is_atomic`
+  tears each write in half and checks that the database is either at the old or the new commit.
+* `iterator_stable_during_concurrent_writes` took its snapshot after releasing the writer and was
+  flaky; the snapshot is now taken first. `page_reuse_non_durable` measures a steady-state cycle.
 
 ## 0.6.0 - 2026-09-02
 
