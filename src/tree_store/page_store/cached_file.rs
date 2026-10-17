@@ -294,6 +294,9 @@ impl CheckedBackend {
     }
 }
 
+/// Upper bound for one merged write issued by `flush_write_buffer`.
+const MAX_COALESCED_WRITE_BYTES: usize = 1 << 20;
+
 pub(super) struct PagedCachedFile {
     file: CheckedBackend,
     page_size: u64,
@@ -462,14 +465,47 @@ impl PagedCachedFile {
     fn flush_write_buffer(&self) -> Result {
         let mut write_buffer = self.write_buffer.lock();
 
+        // The write buffer is a hash map, so its iteration order is random.
+        // Writing it in that order costs one syscall and one random seek per
+        // page. Sort by offset and merge physically adjacent pages (the
+        // allocator hands out the lowest free pages, so a commit's dirty pages
+        // form long runs) into one write each.
+        let mut pending: Vec<(u64, &[u8])> = Vec::with_capacity(write_buffer.cache.len());
         for (offset, buffer) in write_buffer.cache.iter() {
             let raw = buffer.value.as_ref().ok_or_else(|| {
                 StorageError::Internal(String::from(
                     "flush_write_buffer: write cache entry has no data",
                 ))
             })?;
-            self.file.write(*offset, raw)?;
+            pending.push((*offset, &raw[..]));
         }
+        pending.sort_unstable_by_key(|(offset, _)| *offset);
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut i = 0;
+        while i < pending.len() {
+            let (start, first) = pending[i];
+            let mut run_len = first.len();
+            let mut j = i + 1;
+            while j < pending.len()
+                && pending[j].0 == start + run_len as u64
+                && run_len + pending[j].1.len() <= MAX_COALESCED_WRITE_BYTES
+            {
+                run_len += pending[j].1.len();
+                j += 1;
+            }
+            if j == i + 1 {
+                self.file.write(start, first)?;
+            } else {
+                scratch.clear();
+                scratch.reserve(run_len);
+                for (_, page) in &pending[i..j] {
+                    scratch.extend_from_slice(page);
+                }
+                self.file.write(start, &scratch)?;
+            }
+            i = j;
+        }
+        drop(pending);
         for (offset, buffer) in write_buffer.cache.iter_mut() {
             let buffer = buffer.value.take().ok_or_else(|| {
                 StorageError::Internal(String::from(
