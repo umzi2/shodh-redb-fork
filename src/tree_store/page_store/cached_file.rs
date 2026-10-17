@@ -1039,7 +1039,11 @@ mod test {
         fn len(&self) -> core::result::Result<u64, crate::BackendError> {
             self.inner.len()
         }
-        fn read(&self, offset: u64, out: &mut [u8]) -> core::result::Result<(), crate::BackendError> {
+        fn read(
+            &self,
+            offset: u64,
+            out: &mut [u8],
+        ) -> core::result::Result<(), crate::BackendError> {
             self.inner.read(offset, out)
         }
         fn set_len(&self, len: u64) -> core::result::Result<(), crate::BackendError> {
@@ -1083,24 +1087,29 @@ mod test {
         });
         backend.set_len(64 * 128).unwrap();
         let cached_file =
-            PagedCachedFile::new(Box::new(backend.clone()), 128, 1 << 20, 1 << 20, None)
-                .unwrap();
+            PagedCachedFile::new(Box::new(backend.clone()), 128, 1 << 20, 1 << 20, None).unwrap();
 
         // Pages 5,6,7 and 20 and 9,10 (inserted out of order) => runs [5..8), [9..11), [20].
         for page in [20u64, 6, 10, 5, 9, 7] {
             let mut w = cached_file.write(page * 128, 128, true).unwrap();
-            w.mem_mut().unwrap().fill(page as u8 + 1);
+            w.mem_mut().unwrap().fill(u8::try_from(page).unwrap() + 1);
         }
         cached_file.flush().unwrap();
 
         let mut writes = backend.writes.lock().unwrap().clone();
-        writes.sort();
-        assert_eq!(writes, vec![(5 * 128, 3 * 128), (9 * 128, 2 * 128), (20 * 128, 128)]);
+        writes.sort_unstable();
+        assert_eq!(
+            writes,
+            vec![(5 * 128, 3 * 128), (9 * 128, 2 * 128), (20 * 128, 128)]
+        );
 
         for page in [5u64, 6, 7, 9, 10, 20] {
             let mut out = [0u8; 128];
             backend.inner.read(page * 128, &mut out).unwrap();
-            assert!(out.iter().all(|b| *b == page as u8 + 1), "page {page}");
+            assert!(
+                out.iter().all(|b| *b == u8::try_from(page).unwrap() + 1),
+                "page {page}"
+            );
         }
         // An untouched page between runs stays zero.
         let mut out = [1u8; 128];
@@ -1141,7 +1150,10 @@ mod test {
             0,
             "no dirty page may be evicted while the buffer is within half the budget"
         );
-        assert_eq!(cached_file.write_buffer_bytes.load(Ordering::Acquire), 500 * 128);
+        assert_eq!(
+            cached_file.write_buffer_bytes.load(Ordering::Acquire),
+            500 * 128
+        );
 
         // Past half the budget dirty pages are written out, oldest first.
         for page in 500..700u64 {
@@ -1149,7 +1161,10 @@ mod test {
             w.mem_mut().unwrap().fill(2);
         }
         let write_bytes = cached_file.write_buffer_bytes.load(Ordering::Acquire);
-        assert!(write_bytes <= 500 * 128, "write buffer at {write_bytes} bytes");
+        assert!(
+            write_bytes <= 500 * 128,
+            "write buffer at {write_bytes} bytes"
+        );
         assert!(!backend.writes.lock().unwrap().is_empty());
     }
 
@@ -1163,7 +1178,10 @@ mod test {
         for page in 0..900u64 {
             cached_file.read(page * 128, 128, PageHint::None).unwrap();
         }
-        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 900 * 128);
+        assert_eq!(
+            cached_file.read_cache_bytes.load(Ordering::Acquire),
+            900 * 128
+        );
 
         for page in 1000..1400u64 {
             let mut w = cached_file.write(page * 128, 128, true).unwrap();
@@ -1172,8 +1190,14 @@ mod test {
                 + cached_file.write_buffer_bytes.load(Ordering::Acquire);
             assert!(total <= budget, "total {total} exceeds budget {budget}");
         }
-        assert_eq!(cached_file.write_buffer_bytes.load(Ordering::Acquire), 400 * 128);
-        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 600 * 128);
+        assert_eq!(
+            cached_file.write_buffer_bytes.load(Ordering::Acquire),
+            400 * 128
+        );
+        assert_eq!(
+            cached_file.read_cache_bytes.load(Ordering::Acquire),
+            600 * 128
+        );
     }
 
     /// Reads fill the whole budget when nothing is being written.

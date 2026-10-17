@@ -57,7 +57,10 @@ fn variable_length_values_ascending_roundtrip() {
         assert_eq!(got.value(), value_for(i as u64, *len).as_slice(), "key {i}");
     }
     let keys: Vec<u64> = t.iter().unwrap().map(|r| r.unwrap().0.value()).collect();
-    assert!(keys.windows(2).all(|w| w[0] < w[1]), "iteration out of order");
+    assert!(
+        keys.windows(2).all(|w| w[0] < w[1]),
+        "iteration out of order"
+    );
     drop(t);
     drop(rtxn);
     db.check_integrity().unwrap();
@@ -122,7 +125,10 @@ fn repeated_overwrite_of_last_key() {
             }
         }
         assert_eq!(t.len().unwrap(), 3_000);
-        assert_eq!(t.get(2_999).unwrap().unwrap().value(), value_for(499, 100).as_slice());
+        assert_eq!(
+            t.get(2_999).unwrap().unwrap().value(),
+            value_for(499, 100).as_slice()
+        );
     }
     txn.commit().unwrap();
 }
@@ -163,12 +169,19 @@ fn ascending_across_commits_and_reopen() {
         let t = rtxn.open_table(U64_BYTES).unwrap();
         assert_eq!(t.len().unwrap(), next);
         for i in (0..next).step_by(97) {
-            assert_eq!(t.get(i).unwrap().unwrap().value(), value_for(i, 90).as_slice());
+            assert_eq!(
+                t.get(i).unwrap().unwrap().value(),
+                value_for(i, 90).as_slice()
+            );
         }
         let stats = t.stats().unwrap();
         // 90B value + 8B key ~ 38 per 4K page; packed => close to next/38 leaves.
-        let max_leaves = (next / 30) as u64;
-        assert!(stats.leaf_pages() < max_leaves, "{} leaves for {next} rows", stats.leaf_pages());
+        let max_leaves = next / 30;
+        assert!(
+            stats.leaf_pages() < max_leaves,
+            "{} leaves for {next} rows",
+            stats.leaf_pages()
+        );
     }
     db.check_integrity().unwrap();
 }
@@ -290,7 +303,10 @@ fn snapshot_isolated_from_ascending_writer() {
     assert_eq!(t.len().unwrap(), 2_000);
     assert!(t.get(2_000).unwrap().is_none());
     for i in 0..2_000u64 {
-        assert_eq!(t.get(i).unwrap().unwrap().value(), value_for(i, 100).as_slice());
+        assert_eq!(
+            t.get(i).unwrap().unwrap().value(),
+            value_for(i, 100).as_slice()
+        );
     }
 }
 

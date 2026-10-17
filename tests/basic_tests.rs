@@ -2677,4 +2677,3 @@ fn packed_leaves_accept_interior_inserts() {
 
     db.check_integrity().unwrap();
 }
-

@@ -2,9 +2,7 @@
 //! state for pending non-durable commits must be reset at every durable commit
 //! (it used to grow without bound), and neither data nor free space may leak.
 
-use shodh_redb::{
-    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
-};
+use shodh_redb::{Database, Durability, ReadableDatabase, ReadableTableMetadata, TableDefinition};
 use std::collections::BTreeMap;
 
 const T: TableDefinition<u64, &[u8]> = TableDefinition::new("nd");
@@ -156,7 +154,10 @@ fn durable_commit_lifts_the_pending_non_durable_limit() {
         }
     }
     let failed_at = failed_at.expect("the pending limit must trigger");
-    assert!((9_000..=10_100).contains(&failed_at), "failed at {failed_at}");
+    assert!(
+        (9_000..=10_100).contains(&failed_at),
+        "failed at {failed_at}"
+    );
 
     let txn = db.begin_write().unwrap();
     txn.commit().unwrap();

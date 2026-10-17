@@ -522,11 +522,8 @@ impl<'a, 'b, K: Key, V: Value> MutateHelper<'a, 'b, K, V> {
                     builder.push(key, value);
                     let new_page = builder.build()?;
                     let new_page_number = new_page.get_page_number();
-                    let new_page_accessor = LeafAccessor::new(
-                        new_page.memory(),
-                        K::fixed_width(),
-                        self.value_width(),
-                    )?;
+                    let new_page_accessor =
+                        LeafAccessor::new(new_page.memory(), K::fixed_width(), self.value_width())?;
                     let offset = new_page_accessor.offset_of_first_value();
                     let guard = AccessGuardMutInPlace::new(new_page, offset, value.len());
                     return Ok(Box::new(InsertionResult {

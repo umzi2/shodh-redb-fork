@@ -562,7 +562,11 @@ impl TransactionTracker {
         let state = self.state.lock();
 
         for (id, refcount) in &state.live_read_transactions {
-            let nondurable_holds = state.non_durable_ancestor_holds.get(id).copied().unwrap_or(0);
+            let nondurable_holds = state
+                .non_durable_ancestor_holds
+                .get(id)
+                .copied()
+                .unwrap_or(0);
             if *refcount > nondurable_holds {
                 return Ok(Some(*id));
             }
@@ -595,9 +599,13 @@ mod test {
 
         // Three non-durable commits on top of durable transaction 5, one on 7.
         for id in [11, 12, 13] {
-            tracker.register_non_durable_commit(tid(id), tid(5)).unwrap();
+            tracker
+                .register_non_durable_commit(tid(id), tid(5))
+                .unwrap();
         }
-        tracker.register_non_durable_commit(tid(14), tid(7)).unwrap();
+        tracker
+            .register_non_durable_commit(tid(14), tid(7))
+            .unwrap();
         assert_eq!(
             tracker
                 .oldest_live_read_transaction_excluding_nondurable()
@@ -655,17 +663,27 @@ mod test {
     fn clearing_pending_commits_resets_all_non_durable_state() {
         let tracker = TransactionTracker::new(tid(10));
         for id in 11..2_011 {
-            tracker.register_non_durable_commit(tid(id), tid(5)).unwrap();
+            tracker
+                .register_non_durable_commit(tid(id), tid(5))
+                .unwrap();
         }
         // Only some of them were processed through the freed table.
         for id in (11..2_011).step_by(7) {
             tracker.mark_non_durable_commit_processed(tid(id)).unwrap();
         }
-        assert!(tracker.oldest_unprocessed_non_durable_commit().unwrap().is_some());
+        assert!(
+            tracker
+                .oldest_unprocessed_non_durable_commit()
+                .unwrap()
+                .is_some()
+        );
 
         tracker.clear_pending_non_durable_commits().unwrap();
 
-        assert_eq!(tracker.oldest_unprocessed_non_durable_commit().unwrap(), None);
+        assert_eq!(
+            tracker.oldest_unprocessed_non_durable_commit().unwrap(),
+            None
+        );
         assert!(!tracker.is_unprocessed_non_durable_commit(tid(12)).unwrap());
         let state = tracker.state.lock().unwrap();
         assert!(state.pending_non_durable_commits.is_empty());
@@ -682,7 +700,9 @@ mod test {
     fn pending_limit_is_enforced_and_cleared_by_durable_commit() {
         let tracker = TransactionTracker::new(tid(10));
         for id in 0..TransactionTracker::MAX_PENDING_NON_DURABLE as u64 {
-            tracker.register_non_durable_commit(tid(100 + id), tid(5)).unwrap();
+            tracker
+                .register_non_durable_commit(tid(100 + id), tid(5))
+                .unwrap();
         }
         assert!(tracker.register_non_durable_commit(tid(1), tid(5)).is_err());
         tracker.clear_pending_non_durable_commits().unwrap();

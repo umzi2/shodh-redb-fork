@@ -1088,7 +1088,10 @@ fn crash_at_every_write_point_recovers() {
         workload(&db).unwrap();
         let commit_ops = CALIBRATION_BUDGET - remaining.load(Ordering::SeqCst);
         drop(db);
-        (commit_ops, CALIBRATION_BUDGET - remaining.load(Ordering::SeqCst))
+        (
+            commit_ops,
+            CALIBRATION_BUDGET - remaining.load(Ordering::SeqCst),
+        )
     };
     assert!(
         commit_ops >= MIN_OPS,
@@ -1235,7 +1238,11 @@ fn torn_write_at_every_point_is_atomic() {
 
     let open_backend = |path: &std::path::Path, budget: u64| {
         let file_backend = FileBackend::new(
-            OpenOptions::new().read(true).write(true).open(path).unwrap(),
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap(),
         )
         .unwrap();
         let countdown = Arc::new(AtomicU64::new(budget));
@@ -1257,7 +1264,10 @@ fn torn_write_at_every_point_is_atomic() {
         workload(&db).unwrap();
         BUDGET - countdown.load(Ordering::SeqCst)
     };
-    assert!(commit_ops >= 4, "only {commit_ops} operations in the commit");
+    assert!(
+        commit_ops >= 4,
+        "only {commit_ops} operations in the commit"
+    );
 
     let mut saw_old = false;
     let mut saw_new = false;
@@ -1283,7 +1293,11 @@ fn torn_write_at_every_point_is_atomic() {
         let first = t.get(&0).unwrap().unwrap().value().to_vec();
         let new_state = first[0] == 0xDD;
         for i in 0..N {
-            let want = if new_state { vec![0xDD; 64] } else { vec![(i & 0xFF) as u8; 64] };
+            let want = if new_state {
+                vec![0xDD; 64]
+            } else {
+                vec![(i & 0xFF) as u8; 64]
+            };
             assert_eq!(
                 t.get(&i).unwrap().unwrap().value(),
                 want.as_slice(),
