@@ -1577,23 +1577,27 @@ impl<K: Key, V: Value> Btree<K, V> {
                     ))
                 })?
                 .checksum;
-            self.get_helper(root_page.clone(), K::as_bytes(key).as_ref(), expected)
+            self.get_helper(root_page, K::as_bytes(key).as_ref(), expected)
         } else {
             Ok(None)
         }
     }
 
     // Returns the value for the queried key, if present
+    //
+    // `page` is borrowed: only the leaf that holds the value is cloned (for the returned
+    // guard). Cloning every page on the way down costs an atomic increment and decrement on a
+    // reference count that all reader threads share.
     fn get_helper(
         &self,
-        page: PageImpl,
+        page: &PageImpl,
         query: &[u8],
         expected_checksum: Checksum,
     ) -> Result<Option<AccessGuard<'static, V>>> {
         let node_mem = page.memory();
         match node_mem[0] {
             LEAF => {
-                self.maybe_verify_page(&page, expected_checksum)?;
+                self.maybe_verify_page(page, expected_checksum)?;
                 let accessor =
                     LeafAccessor::new(page.memory(), K::fixed_width(), self.value_width())?;
                 if let Some(entry_index) = accessor.find_key::<K>(query) {
@@ -1601,9 +1605,9 @@ impl<K: Key, V: Value> Btree<K, V> {
                         StorageError::invalid_entry_index(page.get_page_number(), entry_index)
                     })?;
                     let guard = if self.compression().is_enabled() {
-                        AccessGuard::with_page_decompress(page, start..end)?
+                        AccessGuard::with_page_decompress(page.clone(), start..end)?
                     } else {
-                        AccessGuard::with_page(page, start..end)
+                        AccessGuard::with_page(page.clone(), start..end)
                     };
                     Ok(Some(guard))
                 } else {
@@ -1611,17 +1615,14 @@ impl<K: Key, V: Value> Btree<K, V> {
                 }
             }
             BRANCH => {
-                self.maybe_verify_page(&page, expected_checksum)?;
-                let accessor = BranchAccessor::new(&page, K::fixed_width())?;
+                self.maybe_verify_page(page, expected_checksum)?;
+                let accessor = BranchAccessor::new(page, K::fixed_width())?;
                 let (child_index, child_page_num) = accessor.child_for_key::<K>(query)?;
                 let child_checksum = accessor.child_checksum(child_index).ok_or_else(|| {
                     StorageError::invalid_child_checksum(page.get_page_number(), child_index)
                 })?;
-                self.get_helper(
-                    self.mem.get_page_extended(child_page_num, self.hint)?,
-                    query,
-                    child_checksum,
-                )
+                let child_page = self.mem.get_page_extended(child_page_num, self.hint)?;
+                self.get_helper(&child_page, query, child_checksum)
             }
             x => Err(StorageError::invalid_page_type(page.get_page_number(), x)),
         }
