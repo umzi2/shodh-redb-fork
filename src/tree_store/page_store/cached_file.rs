@@ -547,9 +547,15 @@ impl PagedCachedFile {
 
     // Caller should invalidate all cached pages that are no longer valid
     pub(super) fn resize(&self, len: u64) -> Result {
-        // Design: full read-cache invalidation on flush. Fine-grained tracking
-        // of written pages would add per-page bookkeeping for marginal benefit.
-        self.invalidate_cache_all();
+        // Growing leaves every cached page valid: a cached page was read from
+        // inside the old length, and the new bytes are only reachable through
+        // pages that have not been read yet. Dropping the whole read cache on
+        // every grow (the common case while a database fills up) threw away
+        // the hot set for nothing. Only shrinking can strand cached pages.
+        let old_len = self.file.len()?;
+        if len < old_len {
+            self.invalidate_cache_all();
+        }
 
         self.file.set_len(len)
     }
@@ -990,6 +996,115 @@ mod test {
         t2.join().unwrap();
         cached_file.invalidate_cache(0, 128);
         assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
+    }
+
+    /// Backend that records every `write` call and forwards to memory.
+    #[derive(Debug)]
+    struct RecordingBackend {
+        inner: InMemoryBackend,
+        writes: std::sync::Mutex<alloc::vec::Vec<(u64, usize)>>,
+    }
+
+    impl StorageBackend for RecordingBackend {
+        fn len(&self) -> core::result::Result<u64, crate::BackendError> {
+            self.inner.len()
+        }
+        fn read(&self, offset: u64, out: &mut [u8]) -> core::result::Result<(), crate::BackendError> {
+            self.inner.read(offset, out)
+        }
+        fn set_len(&self, len: u64) -> core::result::Result<(), crate::BackendError> {
+            self.inner.set_len(len)
+        }
+        fn sync_data(&self) -> core::result::Result<(), crate::BackendError> {
+            self.inner.sync_data()
+        }
+        fn write(&self, offset: u64, data: &[u8]) -> core::result::Result<(), crate::BackendError> {
+            self.writes.lock().unwrap().push((offset, data.len()));
+            self.inner.write(offset, data)
+        }
+    }
+
+    impl StorageBackend for std::sync::Arc<RecordingBackend> {
+        fn len(&self) -> core::result::Result<u64, crate::BackendError> {
+            (**self).len()
+        }
+        fn read(&self, o: u64, out: &mut [u8]) -> core::result::Result<(), crate::BackendError> {
+            (**self).read(o, out)
+        }
+        fn set_len(&self, l: u64) -> core::result::Result<(), crate::BackendError> {
+            (**self).set_len(l)
+        }
+        fn sync_data(&self) -> core::result::Result<(), crate::BackendError> {
+            (**self).sync_data()
+        }
+        fn write(&self, o: u64, d: &[u8]) -> core::result::Result<(), crate::BackendError> {
+            (**self).write(o, d)
+        }
+    }
+
+    /// Dirty pages are written sorted by offset, with physically adjacent pages
+    /// merged into one backend write; the bytes that reach the backend must be
+    /// exactly the bytes of each page.
+    #[test]
+    fn flush_merges_adjacent_dirty_pages_into_one_write() {
+        let backend = std::sync::Arc::new(RecordingBackend {
+            inner: InMemoryBackend::new(),
+            writes: std::sync::Mutex::new(alloc::vec::Vec::new()),
+        });
+        backend.set_len(64 * 128).unwrap();
+        let cached_file =
+            PagedCachedFile::new(Box::new(backend.clone()), 128, 1 << 20, 1 << 20, None)
+                .unwrap();
+
+        // Pages 5,6,7 and 20 and 9,10 (inserted out of order) => runs [5..8), [9..11), [20].
+        for page in [20u64, 6, 10, 5, 9, 7] {
+            let mut w = cached_file.write(page * 128, 128, true).unwrap();
+            w.mem_mut().unwrap().fill(page as u8 + 1);
+        }
+        cached_file.flush().unwrap();
+
+        let mut writes = backend.writes.lock().unwrap().clone();
+        writes.sort();
+        assert_eq!(writes, vec![(5 * 128, 3 * 128), (9 * 128, 2 * 128), (20 * 128, 128)]);
+
+        for page in [5u64, 6, 7, 9, 10, 20] {
+            let mut out = [0u8; 128];
+            backend.inner.read(page * 128, &mut out).unwrap();
+            assert!(out.iter().all(|b| *b == page as u8 + 1), "page {page}");
+        }
+        // An untouched page between runs stays zero.
+        let mut out = [1u8; 128];
+        backend.inner.read(8 * 128, &mut out).unwrap();
+        assert!(out.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn resize_grow_keeps_read_cache_shrink_drops_it() {
+        let backend = InMemoryBackend::new();
+        backend.set_len(1024).unwrap();
+        let cached_file = PagedCachedFile::new(Box::new(backend), 128, 4096, 128, None).unwrap();
+
+        cached_file.read(0, 128, PageHint::None).unwrap();
+        cached_file.read(512, 128, PageHint::None).unwrap();
+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 256);
+
+        // Growing must keep every cached page.
+        cached_file.resize(2048).unwrap();
+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 256);
+        assert_eq!(cached_file.raw_file_len().unwrap(), 2048);
+
+        // Same length: nothing to invalidate either.
+        cached_file.resize(2048).unwrap();
+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 256);
+
+        // Shrinking conservatively drops the read cache.
+        cached_file.resize(256).unwrap();
+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(cached_file.raw_file_len().unwrap(), 256);
+
+        // The retained region is still readable after the shrink.
+        cached_file.read(0, 128, PageHint::None).unwrap();
+        assert_eq!(cached_file.read_cache_bytes.load(Ordering::Acquire), 128);
     }
 
     /// `write` removes the page from the read cache and used to reuse that
