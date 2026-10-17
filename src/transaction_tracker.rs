@@ -102,6 +102,11 @@ struct State {
     //
     // Maps non-durable transaction id -> durable ancestor
     pending_non_durable_commits: HashMap<TransactionId, TransactionId>,
+    // How many pending non-durable commits hold each durable ancestor. Always equal to the
+    // multiset of `pending_non_durable_commits.values()`; kept incrementally so that
+    // `oldest_live_read_transaction_excluding_nondurable()`, which every non-durable commit calls
+    // several times, does not rebuild it from all pending commits (up to 10 000) each time.
+    non_durable_ancestor_holds: BTreeMap<TransactionId, u64>,
     // Non-durable commits which have NOT been processed in the freed table
     unprocessed_freed_non_durable_commits: BTreeSet<TransactionId>,
 }
@@ -122,6 +127,7 @@ impl TransactionTracker {
                 live_write_transaction: None,
                 valid_savepoints: Default::default(),
                 pending_non_durable_commits: Default::default(),
+                non_durable_ancestor_holds: Default::default(),
                 unprocessed_freed_non_durable_commits: Default::default(),
             }),
             #[cfg(feature = "std")]
@@ -227,6 +233,17 @@ impl TransactionTracker {
         #[cfg(not(feature = "std"))]
         let mut state = self.state.lock();
         let ids = mem::take(&mut state.pending_non_durable_commits);
+        state.non_durable_ancestor_holds.clear();
+        // Everything those commits left behind is persisted now, so nothing in
+        // the freed tables needs the non-durable pass any more: `free_if_unpersisted`
+        // would refuse every one of those pages. Dropping the set matters for
+        // cost, not only memory. A commit that freed no pages never appears in the
+        // freed table, so it was never marked processed and stayed here forever;
+        // the oldest such id was then the lower bound of the range scan in
+        // `process_freed_pages_nondurable_helper`, making each non-durable commit
+        // walk every freed-table row since the oldest leftover: commit cost grew
+        // linearly with the number of earlier non-durable commits.
+        state.unprocessed_freed_non_durable_commits.clear();
         for (_, durable_ancestor) in ids {
             if let Some(ref_count) = state.live_read_transactions.get_mut(&durable_ancestor) {
                 *ref_count -= 1;
@@ -294,6 +311,10 @@ impl TransactionTracker {
         state
             .pending_non_durable_commits
             .insert(id, durable_ancestor);
+        *state
+            .non_durable_ancestor_holds
+            .entry(durable_ancestor)
+            .or_insert(0) += 1;
         state.unprocessed_freed_non_durable_commits.insert(id);
         Ok(())
     }
@@ -540,18 +561,131 @@ impl TransactionTracker {
         #[cfg(not(feature = "std"))]
         let state = self.state.lock();
 
-        // Count durable-ancestor holds from non-durable commits.
-        let mut ancestor_holds: BTreeMap<TransactionId, u64> = BTreeMap::new();
-        for ancestor in state.pending_non_durable_commits.values() {
-            *ancestor_holds.entry(*ancestor).or_insert(0) += 1;
-        }
-
         for (id, refcount) in &state.live_read_transactions {
-            let nondurable_holds = ancestor_holds.get(id).copied().unwrap_or(0);
+            let nondurable_holds = state.non_durable_ancestor_holds.get(id).copied().unwrap_or(0);
             if *refcount > nondurable_holds {
                 return Ok(Some(*id));
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod test {
+    use super::{TransactionId, TransactionTracker};
+
+    fn tid(n: u64) -> TransactionId {
+        TransactionId::new(n)
+    }
+
+    /// Non-durable commits hold their durable ancestor with a synthetic read
+    /// reference. `oldest_live_read_transaction_excluding_nondurable` must see
+    /// through those, and report only references that real readers hold.
+    #[test]
+    fn excluding_nondurable_ignores_synthetic_holds_only() {
+        let tracker = TransactionTracker::new(tid(10));
+        // No readers, no pending commits.
+        assert_eq!(
+            tracker
+                .oldest_live_read_transaction_excluding_nondurable()
+                .unwrap(),
+            None
+        );
+
+        // Three non-durable commits on top of durable transaction 5, one on 7.
+        for id in [11, 12, 13] {
+            tracker.register_non_durable_commit(tid(id), tid(5)).unwrap();
+        }
+        tracker.register_non_durable_commit(tid(14), tid(7)).unwrap();
+        assert_eq!(
+            tracker
+                .oldest_live_read_transaction_excluding_nondurable()
+                .unwrap(),
+            None,
+            "synthetic holds alone are not readers"
+        );
+
+        // A real reader on 7 shows up on top of the synthetic hold.
+        *tracker
+            .state
+            .lock()
+            .unwrap()
+            .live_read_transactions
+            .get_mut(&tid(7))
+            .unwrap() += 1;
+        assert_eq!(
+            tracker
+                .oldest_live_read_transaction_excluding_nondurable()
+                .unwrap(),
+            Some(tid(7))
+        );
+
+        // A real reader on 5 is older and wins.
+        *tracker
+            .state
+            .lock()
+            .unwrap()
+            .live_read_transactions
+            .get_mut(&tid(5))
+            .unwrap() += 1;
+        assert_eq!(
+            tracker
+                .oldest_live_read_transaction_excluding_nondurable()
+                .unwrap(),
+            Some(tid(5))
+        );
+
+        // The incremental bookkeeping always equals the multiset of ancestors.
+        {
+            let state = tracker.state.lock().unwrap();
+            let mut expected = std::collections::BTreeMap::new();
+            for ancestor in state.pending_non_durable_commits.values() {
+                *expected.entry(*ancestor).or_insert(0u64) += 1;
+            }
+            assert_eq!(state.non_durable_ancestor_holds, expected);
+        }
+    }
+
+    /// A durable commit persists everything the pending non-durable commits
+    /// left behind: their synthetic holds, their ancestor bookkeeping and the
+    /// "unprocessed" markers must all be gone, whether or not their freed pages
+    /// were ever processed.
+    #[test]
+    fn clearing_pending_commits_resets_all_non_durable_state() {
+        let tracker = TransactionTracker::new(tid(10));
+        for id in 11..2_011 {
+            tracker.register_non_durable_commit(tid(id), tid(5)).unwrap();
+        }
+        // Only some of them were processed through the freed table.
+        for id in (11..2_011).step_by(7) {
+            tracker.mark_non_durable_commit_processed(tid(id)).unwrap();
+        }
+        assert!(tracker.oldest_unprocessed_non_durable_commit().unwrap().is_some());
+
+        tracker.clear_pending_non_durable_commits().unwrap();
+
+        assert_eq!(tracker.oldest_unprocessed_non_durable_commit().unwrap(), None);
+        assert!(!tracker.is_unprocessed_non_durable_commit(tid(12)).unwrap());
+        let state = tracker.state.lock().unwrap();
+        assert!(state.pending_non_durable_commits.is_empty());
+        assert!(state.non_durable_ancestor_holds.is_empty());
+        assert!(state.unprocessed_freed_non_durable_commits.is_empty());
+        assert!(
+            state.live_read_transactions.is_empty(),
+            "the synthetic holds must be released"
+        );
+    }
+
+    /// The pending limit still applies, and clearing makes room again.
+    #[test]
+    fn pending_limit_is_enforced_and_cleared_by_durable_commit() {
+        let tracker = TransactionTracker::new(tid(10));
+        for id in 0..TransactionTracker::MAX_PENDING_NON_DURABLE as u64 {
+            tracker.register_non_durable_commit(tid(100 + id), tid(5)).unwrap();
+        }
+        assert!(tracker.register_non_durable_commit(tid(1), tid(5)).is_err());
+        tracker.clear_pending_non_durable_commits().unwrap();
+        tracker.register_non_durable_commit(tid(1), tid(5)).unwrap();
     }
 }
