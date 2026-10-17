@@ -299,8 +299,11 @@ fn iterator_stable_during_concurrent_writes() {
     let reader_db = db.clone();
     let reader_barrier = barrier.clone();
     let reader_handle = thread::spawn(move || {
-        reader_barrier.wait();
+        // The snapshot is taken *before* the writer is released. Beginning it
+        // after the barrier raced the writer's first commit: the reader could
+        // legitimately see 5500 rows instead of the 5000 seeded ones.
         let txn = reader_db.begin_read().unwrap();
+        reader_barrier.wait();
         let t = txn.open_table(TABLE).unwrap();
 
         let mut count = 0u64;
