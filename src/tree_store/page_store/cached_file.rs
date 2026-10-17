@@ -1231,6 +1231,42 @@ mod test {
         assert_eq!(cached_file.write_buffer_bytes.load(Ordering::Acquire), 0);
     }
 
+    /// A cache miss and a read-modify-write of an unbuffered page both fill
+    /// their buffer straight from the backend: the bytes must match exactly.
+    #[test]
+    fn cold_read_and_cold_write_see_the_backend_bytes() {
+        let (backend, cached_file) = recording_cache(64, 1 << 20, 1 << 20);
+        let mut pattern = alloc::vec![0u8; 128];
+        for (i, b) in pattern.iter_mut().enumerate() {
+            *b = u8::try_from(i).unwrap() ^ 0x5A;
+        }
+        backend.inner.write(7 * 128, &pattern).unwrap();
+
+        // Miss -> read from the backend.
+        let page = cached_file.read(7 * 128, 128, PageHint::None).unwrap();
+        assert_eq!(&*page, pattern.as_slice());
+        // Hit -> same bytes.
+        assert_eq!(
+            &*cached_file.read(7 * 128, 128, PageHint::None).unwrap(),
+            pattern.as_slice()
+        );
+
+        // A write that does not overwrite starts from the stored bytes.
+        backend.inner.write(9 * 128, &pattern).unwrap();
+        let mut w = cached_file.write(9 * 128, 128, false).unwrap();
+        assert_eq!(w.mem(), pattern.as_slice());
+        w.mem_mut().unwrap()[0] ^= 0xFF;
+        drop(w);
+        cached_file.flush().unwrap();
+        let mut out = [0u8; 128];
+        backend.inner.read(9 * 128, &mut out).unwrap();
+        assert_eq!(out[0], pattern[0] ^ 0xFF);
+        assert_eq!(&out[1..], &pattern[1..]);
+
+        // A short read past the end is an error, not a partial buffer.
+        assert!(cached_file.read(70 * 128, 128, PageHint::None).is_err());
+    }
+
     #[test]
     fn resize_grow_keeps_read_cache_shrink_drops_it() {
         let backend = InMemoryBackend::new();
